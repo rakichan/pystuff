@@ -1,0 +1,44 @@
+#!/usr/bin/env python
+
+'''
+Must be run in the directory that has the OBJ files in it, and a 'conv'
+directory 
+
+'''
+
+import os, sys, errno, msg
+import danibb, dwd
+import subprocess
+import sys
+from argparse import ArgumentParser
+
+from modeltools.convert2ptx import *
+
+if __name__ == "__main__":
+    parser = ArgumentParser(description=
+            """For converting tif file textures from zbrush into ptex files
+            usable in the pipeline. This program performs a point cloud
+            transfer of OBJ and .tif file data saved in the 'conv' directory
+            and then cleans up after itself. Output is saved in a
+            'zbrush_color' folder, unless you specify -o (overwrite), in which
+            case files will go in the element's 'Color_base' area.""")
+       
+    parser.add_argument('-o', '--overwrite', default=False,
+            help='If you want to overwrite Color_base and displacement texture dirs.')
+    args = parser.parse_args()
+    overwrite = args.overwrite
+    
+    # gather all of the appropriate data to begin execution
+    workdir, texdir = checkToExecute()
+    objlist = [{}, {}, {}, {}]
+    dirList = getOutputDir(overwrite, texdir)
+    infolist = cleanupConversionDir(workdir)
+    objInfo = getOBJFiles(workdir)
+
+    # iterate through collected data and convert ptx files.
+    for i in range(len(infolist)):
+        objlist[i]= pairTexturesWithObjs(infolist[i], objInfo)
+        for obj, tiff in objlist[i].items():
+            convertPtex(tiff, obj, dirList[i], False)
+            print "\nItem completed. Output Directory is:\n" + dirList[i]
+    
