@@ -1,0 +1,249 @@
+#!/usr/bin/env python
+
+"""
+missingVariants
+
+Compare what variants are in shotgun vs rapfile for all elements.
+Present the user with a GUI and the option to (additive) sync rapfile
+with shotgun.
+    - variants in rapfile will only be pushed to shotgun, none are deleted
+"""
+
+
+
+from PyQt4.QtCore import Qt
+from PyQt4.QtGui import (QLabel, QPushButton, QVBoxLayout, QWidget, QGridLayout, QFont, QMessageBox,
+                         QApplication, QListWidget, QListWidgetItem, QScrollArea, QMainWindow)
+import sys
+import argparse
+import msg
+import time
+import elementsdb
+from coreservices import prodmanUtils
+from assethelpers import asset_helpers
+import err
+import multiprocessing
+from multiprocessing.pool import Pool
+from coreservices.prodmanUtils import ElementPublish
+
+
+def parseArguments():
+    parser = argparse.ArgumentParser(prog="missingVariants",
+                                     description=('Compare all in-picture element variants in shotgun vs rapfiles'))
+    parser.add_argument("-c", "--category", nargs='+',
+                        help=("Element category, by default all categories are used. Valid options include "
+                              "Camera, Character, Character Prop, Set Prop, Crowd, FX, Light"))
+    return parser.parse_args()
+
+
+class CheckListWidget(QWidget):
+    """
+    Sub-widget of checkboxes for missing variants
+    """
+    def __init__(self, itemList):
+        super(CheckListWidget, self).__init__()
+        layout = QVBoxLayout()
+        self.list = QListWidget()
+        layout.addWidget(self.list)
+        layout.addStretch()
+        self.setLayout(layout)
+
+        self.addItems(itemList)
+
+    def addItems(self, itemList):
+        for i in sorted(itemList):
+            item = QListWidgetItem(i)
+            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            item.setCheckState(Qt.Unchecked)
+            self.list.addItem(item)
+        self.list.setMinimumHeight(self.list.sizeHintForRow(0)*(self.list.count()+.5))
+
+    def getCheckedItems(self):
+        return [str(self.list.item(c).text()) for c in range(self.list.count()) if self.list.item(c).checkState()]
+
+
+class CategoryWidget(QWidget):
+    """
+    Sub-widget to display category name, and all elements/variants within that category
+    """
+    def __init__(self, categoryName, categoryDict):
+        super(CategoryWidget, self).__init__()
+        layout = QVBoxLayout()
+
+        categoryLabel = QLabel(categoryName)
+        categoryLabel.setAlignment(Qt.AlignCenter)
+        categoryLabel.setStyleSheet("QLabel { background-color : blue; color : white; font: bold 14px; }")
+        font = QFont()
+        font.bold()
+        categoryLabel.setFont(font)
+        layout.addWidget(categoryLabel)
+
+        self.grid = QGridLayout()
+        self.grid.setColumnMinimumWidth(0, 160)
+        self._populateWidget(categoryDict)
+        layout.addLayout(self.grid)
+
+        self.setLayout(layout)
+
+    def _populateWidget(self, categoryDict):
+        for index, elem in enumerate(sorted(categoryDict)):
+            # Element name
+            self.grid.addWidget(QLabel(elem), index, 0, Qt.AlignRight)
+
+            # Variants list
+            list = CheckListWidget(categoryDict[elem])
+            self.grid.addWidget(list, index, 1)
+
+    def commitSelected(self):
+        found = 0
+        for row in range(self.grid.rowCount()):
+            element = str(self.grid.itemAtPosition(row,0).widget().text())
+            list = self.grid.itemAtPosition(row, 1).widget()
+            variants = list.getCheckedItems()
+
+            if variants:
+                shotgunEvent = ElementPublish(element, 'Look', "missingVariants::publish to shotgun")
+                shotgunEvent.addVariantList(variants)
+                shotgunEvent.publish()
+                found += len(variants)
+
+        return found
+
+class DisplayWidget(QWidget):
+    """
+    Main widget visible in the MissingVariantsUI
+    """
+    def __init__(self, category, parent=None):
+        super(DisplayWidget, self).__init__()
+
+        self.category = category
+        layout = QVBoxLayout()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+
+        dummy = QWidget()
+        self.mainLayout = QVBoxLayout()
+
+        self.missingFromShotgun = {}
+        self._populateWidget()
+
+        dummy.setLayout(self.mainLayout)
+        scroll.setWidget(dummy)
+        layout.addWidget(scroll)
+
+        # Commit Button
+        commitButton = QPushButton("Publish Checked Variants to Shotgun")
+        commitButton.clicked.connect(self._commitSelectedToShotgun)
+        layout.addWidget(commitButton)
+
+        self.setLayout(layout)
+
+    def _populateWidget(self):
+        self._findMissingVariants()
+        self._populateList()
+
+
+    def _findMissingVariants(self):
+        """
+        Populate dict of variants missing in shotgun but present in rapfile
+        """
+        context = "missingVariants::findMissingVariants"
+        msg.postStatus("Searching for missing variants... This will take a few minutes. Grab some coffee :)", context)
+
+        startTime = time.time()
+        processing_pool = Pool(8)
+        manager = multiprocessing.Manager()
+        queue = manager.Queue()
+
+        for elem in elementsdb.getElements(inPicture=True):
+            if elem.startswith('m_'):
+                # We can skip master sets - they have no variant
+                continue
+
+            processing_pool.apply_async(_findMissingVariantsForElement, args=(elem, self.category, queue,),
+                                        callback=self._processMissingVariants)
+
+        processing_pool.close()
+        processing_pool.join()
+        endTime = time.time()
+        msg.postStatus("Search took about %d minutes"%int((endTime-startTime)/60), context)
+
+    def _processMissingVariants(self, queue):
+
+        elem, missingVars = queue.get()
+        if missingVars:
+            category = prodmanUtils.getElementInfo(elem)['pm_category']
+            if category not in self.missingFromShotgun:
+                self.missingFromShotgun[category] = {}
+
+            self.missingFromShotgun[category][elem] = missingVars
+
+
+    def _populateList(self):
+        """
+        Populate the GUI with the elements/variants missing from shotgun
+        """
+        for category in sorted(self.missingFromShotgun):
+            self.mainLayout.addWidget(CategoryWidget(category, self.missingFromShotgun[category]))
+
+    def _commitSelectedToShotgun(self):
+        """
+        Commit the selected missing element/variants to shotgun
+        Alert the user, and close the application
+        """
+        publishCount = 0
+        for idx in range(self.mainLayout.count()):
+            publishCount += self.mainLayout.itemAt(idx).widget().commitSelected()
+
+        ret = QMessageBox.information(self, "Complete!", "Published %d variants to Shotgun." % publishCount,
+                                      QMessageBox.Ok, QMessageBox.Ok)
+        self.parent().close()
+
+
+def _findMissingVariantsForElement(elem, category, queue):
+
+    difference = []
+    shotgun_category = prodmanUtils.getElementInfo(elem)['pm_category']
+    if category and shotgun_category not in category:
+        pass
+    else:
+        try:
+            shotgunVars = set(prodmanUtils.getElementVariants(elem))
+            rapfileVars = set(asset_helpers.get_variants(elem))
+            difference = list(rapfileVars.difference(shotgunVars))
+        except Exception as error:
+            msg.postWarning("Could not find element: %s" % elem, 'missingVariants')
+
+
+    queue.put((elem, difference))
+    return queue
+
+
+class MissingVariantsUI(QMainWindow):
+    """
+    UI used to display the elements with variants missing from shotgun
+    """
+    def __init__(self, category):
+        super(MissingVariantsUI, self).__init__()
+        self.setWindowTitle("Missing Variants")
+        main = DisplayWidget(category, self)
+        self.setCentralWidget(main)
+        self.setMinimumWidth(500)
+        self.setMinimumHeight(300)
+
+
+if __name__ == "__main__":
+    pargs = parseArguments()
+    category = pargs.category
+    if category:
+        for cat in category:
+            if cat not in ["Camera", "Character", "Character Prop", "Set Prop", "Crowd", "FX", "Light"]:
+                msg.postError('Invalid category "%s". Category must be one of the following options: '
+                              'Camera, Character, Character Prop, Set Prop, Crowd, FX, Light' % cat, 'missingVariants') 
+                sys.exit()
+
+    app = QApplication(sys.argv)
+    window = MissingVariantsUI(category)
+    window.show()
+    sys.exit(app.exec_())
