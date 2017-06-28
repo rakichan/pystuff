@@ -1,0 +1,123 @@
+#!/usr/bin/env python
+
+'''
+command line utility to delete a shot, remove all data and links
+'''
+
+
+import os, sys, re
+import argparse
+from subprocess import Popen, PIPE, STDOUT
+
+import msg
+
+
+def conform_seq_shot(seq, shot):
+    '''
+    make sure seq shot complies with our convention
+    and returns proper sequence/shot
+    @type  seq: C{str}
+    @param seq: sequence 
+    @type  shot: C{str}
+    @param shot: shot
+    '''
+    
+    if re.search('[a-z]', seq):
+        seq = str(seq)
+    else:
+        seq = '%04.1f' % float(seq)
+    if re.search('[a-z]', shot):
+        shot = str(shot)
+    else:
+        shot = '%06.2f' % float(shot)
+    
+    return seq, shot
+     
+
+def main() :
+    '''
+    core of program
+    '''
+
+    parser = argparse.ArgumentParser(description='Delete shot (all data).')
+
+    parser.add_argument('--seq', dest = 'seq', help = 'sequence (required)')
+    parser.add_argument('--shot', dest='shot', help='shot (required)')
+    
+    parsedArgs = parser.parse_args()
+
+    seq  = parsedArgs.seq
+    shot = parsedArgs.shot
+   
+    # conforming seq/shot input to actual seq/shot convention
+    if not seq or not shot:
+        msg.postError("please provide sequence and shot (--help for more info)")
+        return 
+    seq, shot = conform_seq_shot(seq, shot)
+    
+    # make sure that the shot exist, prior to proceeding
+    shot_dir = os.path.join(os.getenv('PRODROOT'),'work', 'Sequences', 'seq', seq, shot)
+    if not os.path.isdir(shot_dir):
+        msg.postError("shot: " + seq + " " + shot + " doesn't exist")
+        return
+    
+    # before going any further, we make sure we are running as lean
+    user_id = os.getuid()
+    if user_id != 3379:
+        msg.postError("You are not 'lean', sudo as lean and run again.")
+        return
+
+    # construct the path for remove commands
+    rm_path1 = shot_dir.replace("work", "*") + "/*"
+    rm_path2 = shot_dir.replace("work/Sequences", "*") + "/*"
+    
+    # confirm that you have sudo before proceeding
+    sMsg   = "Are you sure you want to remove shot: " + seq + " " + shot + \
+             "\nAll data for the shot will be lost. (y/n)?"
+    answer = raw_input(sMsg)
+    
+    if answer.lower() == "y":
+        msg.postStatus("Removing shot... " + seq + " " + shot)
+        
+        # building the remove command with lean
+        sCmd = 'rm -rf ' + rm_path1 + '; rm -rf ' + rm_path2
+        msg.postStatus("removing: " + rm_path1)
+        msg.postStatus("removing: " + rm_path2)
+        proc = Popen(
+                      sCmd,
+                      shell  = True,
+                      stdout = PIPE,
+                      stderr = STDOUT,
+                      env    = os.environ
+                     )
+        proc.communicate()
+        msg.postStatus("-"*50)
+
+        # now using linkman to remove the links from mkshot
+        link_cmd       = "linkman --remove --path "
+        link_work_path = shot_dir
+        link_rel_path  = shot_dir.replace("work/Sequences", "rel")
+        link_repo_path = shot_dir.replace("work/Sequences", "repository")
+        msg.postStatus("removing link: " + link_work_path)
+        msg.postStatus("removing link: " + link_rel_path)
+        msg.postStatus("removing link: " + link_repo_path)
+
+        sCmd2 = link_cmd + link_work_path + "; " + \
+                link_cmd + link_rel_path + "; " + \
+                link_cmd + link_repo_path
+        proc2 = Popen(
+                       sCmd2,
+                       shell  = True,
+                       stdout = PIPE,
+                       stderr = STDOUT,
+                       env    = os.environ
+                      )
+        proc2.communicate()
+        msg.postStatus("Done deleting shot.")
+
+    else:
+        msg.postStatus("Nothing done, exiting.")
+
+
+if __name__=='__main__':
+    main()
